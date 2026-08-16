@@ -49,6 +49,7 @@
 
 /* Line payload format */
 #define DATA_BITS_PER_LINE      120          /* must be divisible by 8 */
+                                // Another option for 176,400 bytes/sec is 112 bits per line, 196 RS_K, 223 RS_N
 #define PREAMBLE_BITS           12
 #define TOTAL_BITS_PER_LINE     (PREAMBLE_BITS + DATA_BITS_PER_LINE)
 
@@ -63,8 +64,8 @@
 #define VBI_LINES               18  // Normally 17, but this silly VCR wastes 1 more line for WSS
 
 /* Reed-Solomon */
-#define RS_N                    255
-#define RS_K                    223
+#define RS_N                    202
+#define RS_K                    168
 #define NSYM                    (RS_N - RS_K)   /* 32 parity symbols */
 
 #define FIELD_STREAM_BYTES      (DATA_LINES * LINE_BYTES)   /* 288 * 9 = 2592 */
