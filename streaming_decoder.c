@@ -638,8 +638,6 @@ static size_t read_chunk(FILE *f, uint8_t *buf, size_t n)
     return fread(buf, 1, n, f);
 }
 
-static const uint8_t SILENCE[FIELD_PAYLOAD] = {0};
-
 /* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
