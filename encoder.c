@@ -19,6 +19,13 @@
 #include "rs_codec.h"
 #include "vhs_params.h"
 
+typedef enum {
+    MODE_DATA,
+    MODE_AUDIO
+} Mode;
+
+Mode mode = MODE_DATA;
+
 /* ---------- helpers ---------- */
 
 static void die(const char *msg)
@@ -220,24 +227,38 @@ int main(int argc, char **argv)
     const char *input_path  = NULL;
     const char *output_path = NULL;
     uint32_t sample_rate    = DEFAULT_SAMPLE_RATE;
-    int i;
+    int data_set = 0;
+    int audio_set = 0;
 
-    /* crude argument parsing */
-    for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--sample-rate") == 0) {
-            if (++i >= argc) die("--sample-rate needs a value");
-            sample_rate = (uint32_t)strtoul(argv[i], NULL, 10);
-            if (sample_rate == 0) die("invalid sample rate");
-        } else if (!input_path) {
-            input_path = argv[i];
-        } else if (!output_path) {
-            output_path = argv[i];
+    // 1. Parse flags
+    int i = 1;
+    while (i < argc && argv[i][0] == '-') {
+        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--data") == 0) {
+            data_set = 1;
+        } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--audio") == 0) {
+            audio_set = 1;
         } else {
-            die("too many arguments");
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            fprintf(stderr, "Usage: %s [-d|--data | -a|--audio] [<input.raw>] <output_file>\n", argv[0]);
+            return 1;
         }
+        i++;
     }
-    if (!input_path || !output_path)
-        die("usage: encode <input_file> <output.raw> [--sample-rate N]");
+
+    // 2. Validate flags and set mode
+    if (data_set && audio_set) {
+        fprintf(stderr, "Error: cannot specify both -d/--data and -a/--audio\n");
+        return 1;
+    }
+    mode = audio_set ? MODE_AUDIO : MODE_DATA;
+    int remaining = argc - i;
+    if (remaining == 2) {
+        input_path  = argv[argc - 2];
+        output_path = argv[argc - 1];
+    } else {
+        fprintf(stderr, "usage: encode <input_file> <output.raw>\n", argv[0]);
+        return 1;
+    }
 
     Geometry g;
     geometry_init(&g, sample_rate);
@@ -259,23 +280,31 @@ int main(int argc, char **argv)
     fclose(inf);
 
     size_t data_len = (size_t)fsz;
+    uint8_t *blob = NULL;
+    size_t blob_len = 0;
 
     /* blob = MAGIC + length(4 LE) + crc32(4 LE) + data */
-    size_t blob_len = HEADER_LEN + data_len;
-    uint8_t *blob = xmalloc(blob_len);
-    memcpy(blob, MAGIC, 4);
-    uint32_t len32 = (uint32_t)data_len;
-    uint32_t crc   = crc32_zlib(data, data_len);
-    blob[4] = (uint8_t)(len32);
-    blob[5] = (uint8_t)(len32 >> 8);
-    blob[6] = (uint8_t)(len32 >> 16);
-    blob[7] = (uint8_t)(len32 >> 24);
-    blob[8]  = (uint8_t)(crc);
-    blob[9]  = (uint8_t)(crc >> 8);
-    blob[10] = (uint8_t)(crc >> 16);
-    blob[11] = (uint8_t)(crc >> 24);
-    memcpy(blob + HEADER_LEN, data, data_len);
-    free(data);
+    if (mode == MODE_DATA) {
+        blob_len = HEADER_LEN + data_len;
+        blob = xmalloc(blob_len);
+        memcpy(blob, MAGIC, 4);
+        uint32_t len32 = (uint32_t)data_len;
+        uint32_t crc   = crc32_zlib(data, data_len);
+        blob[4] = (uint8_t)(len32);
+        blob[5] = (uint8_t)(len32 >> 8);
+        blob[6] = (uint8_t)(len32 >> 16);
+        blob[7] = (uint8_t)(len32 >> 24);
+        blob[8]  = (uint8_t)(crc);
+        blob[9]  = (uint8_t)(crc >> 8);
+        blob[10] = (uint8_t)(crc >> 16);
+        blob[11] = (uint8_t)(crc >> 24);
+        memcpy(blob + HEADER_LEN, data, data_len);
+        free(data);
+    } else {
+        blob_len = data_len;
+        blob = xmalloc(blob_len);
+        memcpy(blob, data, data_len);
+    }
 
     /* number of fields (round up, then force even) */
     size_t n_fields = (blob_len + FIELD_PAYLOAD - 1) / FIELD_PAYLOAD;
@@ -321,7 +350,7 @@ int main(int argc, char **argv)
     printf("Output          : %s (%llu samples, %.0f ms of video)\n",
            output_path, (unsigned long long)total,
            total / (double)g.sr * 1000.0);
-    printf("Effective rate  : %.1f kB/s of payload\n",
+    printf("Effective rate  : %.3f kB/s of payload\n",
            FIELD_PAYLOAD * 50.0 / 1000.0);
 
     return 0;

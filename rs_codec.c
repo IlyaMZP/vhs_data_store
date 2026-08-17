@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 static uint8_t gf_exp[512];
 static uint8_t gf_log[256];
@@ -147,49 +148,87 @@ static rs_status_t find_error_evaluator(const uint8_t *synd, size_t synd_len,
 }
 
 static rs_status_t correct_errata(uint8_t *msg, size_t mlen,
-                                  const uint8_t *synd, size_t synd_len,
+                                  const uint8_t *synd, size_t nsym,
                                   const size_t *err_pos, size_t nerr) {
     if (!nerr) return RS_OK;
+    if (nerr > mlen) return RS_ERR_INVALID_ARGUMENT;
 
-    size_t coef_pos[256];
-    for (size_t i = 0; i < nerr; ++i)
-        coef_pos[i] = mlen - 1 - err_pos[i];
+    uint8_t err_loc[257];
+    size_t err_loc_len;
 
-    uint8_t err_loc[257], err_eval[257];
-    size_t err_loc_len, err_eval_len;
     rs_status_t st = find_errata_locator(err_pos, nerr, err_loc,
                                          &err_loc_len, mlen);
     if (st != RS_OK) return st;
 
-    /* Python uses synd[::-1] here. */
-    uint8_t rev_synd[256];
-    for (size_t i = 0; i < synd_len; ++i)
-        rev_synd[i] = synd[synd_len - 1 - i];
+    /*
+     * synd[] is stored as:
+     *
+     *   synd[0] = dummy zero
+     *   synd[1] = S0
+     *   synd[2] = S1
+     *   ...
+     *   synd[nsym] = S_{nsym-1}
+     *
+     * poly_eval()/poly_mul() use big-endian polynomials, so
+     * S(x) = S0 + S1 x + ... is stored reversed.
+     */
+    uint8_t srev[256];
+    for (size_t i = 0; i < nsym; ++i)
+        srev[i] = synd[nsym - i];
 
-    st = find_error_evaluator(rev_synd, synd_len, err_loc, err_loc_len,
-                              err_loc_len - 1, err_eval, &err_eval_len);
+    /*
+     * Omega(x) = S(x) * Lambda(x) mod x^nsym.
+     *
+     * In big-endian representation, the low nsym coefficients are
+     * simply the last nsym coefficients of the full product.
+     */
+    size_t prod_len = nsym + err_loc_len - 1;
+    uint8_t prod[512];
+
+    st = poly_mul(srev, nsym, err_loc, err_loc_len, prod, prod_len);
     if (st != RS_OK) return st;
 
-    /* Python reverses the evaluator before evaluating. */
+    const uint8_t *omega = prod + prod_len - nsym;
+
     uint8_t X[256];
-    for (size_t i = 0; i < nerr; ++i)
-        X[i] = gf_pow(2, -(255 - (int)coef_pos[i]));
+
+    for (size_t i = 0; i < nerr; ++i) {
+        if (err_pos[i] >= mlen)
+            return RS_ERR_INVALID_ARGUMENT;
+
+        size_t coef_pos = mlen - 1 - err_pos[i];
+        X[i] = gf_pow(2, (int)coef_pos);
+    }
 
     for (size_t i = 0; i < nerr; ++i) {
         uint8_t Xi = X[i];
         uint8_t Xi_inv = gf_inv(Xi);
+
+        /*
+         * Lambda(x) = prod_j (1 + X_j x)
+         *
+         * Lambda'(Xi^{-1}) = Xi * prod_{j != i} (1 + X_j Xi^{-1})
+         *
+         * With the usual Forney formula for first root alpha^0,
+         * the extra Xi cancels, leaving division by the product term.
+         */
         uint8_t prime = 1;
         for (size_t j = 0; j < nerr; ++j) {
-            if (j != i)
-                prime = gf_mul(prime, (uint8_t)(1 ^ gf_mul(Xi_inv, X[j])));
+            if (j != i) {
+                uint8_t term = (uint8_t)(1 ^ gf_mul(Xi_inv, X[j]));
+                prime = gf_mul(prime, term);
+            }
         }
-        if (!prime) return RS_ERR_CORRECT;
 
-        uint8_t y = poly_eval(err_eval, err_eval_len, Xi_inv);
-        y = gf_mul(Xi, y);
-        if (!prime) return RS_ERR_CORRECT;
-        msg[err_pos[i]] ^= gf_div(y, prime);
+        if (!prime)
+            return RS_ERR_CORRECT;
+
+        uint8_t omega_val = poly_eval(omega, nsym, Xi_inv);
+        uint8_t err_val = gf_div(omega_val, prime);
+
+        msg[err_pos[i]] ^= err_val;
     }
+
     return RS_OK;
 }
 
@@ -247,7 +286,11 @@ static rs_status_t find_error_locator(const uint8_t *synd, size_t synd_len,
     err_len -= first;
     if (first) memmove(err_loc, err_loc + first, err_len);
     size_t errs = err_len ? err_len - 1 : 0;
-    long capacity_used = 2L * ((long)errs - (long)erase_count) + (long)erase_count;
+    size_t unknown_errs = errs;
+    if (erase_loc && erase_len && errs >= erase_count)
+        unknown_errs = errs - erase_count;
+
+    long capacity_used = 2L * (long)unknown_errs + (long)erase_count;
     if (capacity_used > (long)nsym)
         return RS_ERR_TOO_MANY_ERRORS;
     memcpy(out, err_loc, err_len);
@@ -275,11 +318,15 @@ static void forney_syndromes(const uint8_t *synd, size_t nsym,
                              uint8_t *fsynd) {
     size_t len = nsym;
     memcpy(fsynd, synd + 1, nsym);
-    for (size_t i = 0; i < npos; ++i) {
+
+    for (size_t i = 0; i < npos && len > 0; ++i) {
         size_t reversed = nmess - 1 - pos[i];
         uint8_t x = gf_pow(2, (int)reversed);
+
         for (size_t j = 0; j + 1 < len; ++j)
             fsynd[j] = gf_mul(fsynd[j], x) ^ fsynd[j + 1];
+
+        --len;
     }
 }
 
@@ -362,6 +409,14 @@ rs_status_t rs_decode(uint8_t *codeword, size_t codeword_len, size_t nsym,
     if (st != RS_OK) return st;
 
     size_t all_pos[256];
+    // We can catch a tiny percentage more errors
+    /*for (size_t i = 0; i < err_count; ++i) {
+        for (size_t j = 0; j < erase_count; ++j) {
+            if (err_pos[i] == erase_pos[j]) {
+                return RS_ERR_LOCATE_ERRORS;
+            }
+        }
+    }*/
     for (size_t i = 0; i < erase_count; ++i) all_pos[i] = erase_pos[i];
     for (size_t i = 0; i < err_count; ++i) all_pos[erase_count + i] = err_pos[i];
 

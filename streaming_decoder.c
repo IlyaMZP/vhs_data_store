@@ -15,10 +15,17 @@
 #include <stdint.h>
 #include <math.h>
 #include <errno.h>
-#include <zlib.h>          /* crc32 */
+#include <zlib.h>
 
 #include "rs_codec.h"
 #include "vhs_params.h"
+
+typedef enum {
+    MODE_DATA,
+    MODE_AUDIO
+} Mode;
+
+Mode mode = MODE_DATA;
 
 /* ------------------------------------------------------------------ */
 /* DPLL tracking gains (early-late gate)                               */
@@ -478,17 +485,18 @@ typedef struct {
     size_t codewords_failed;
 } Stats;
 
-/* Decode one field. On success returns a newly allocated FIELD_PAYLOAD-byte
- * buffer (caller frees); on failure returns NULL. */
-static uint8_t *decode_field(const float *samples, size_t n_samples,
-                             const uint32_t *starts, const int8_t *kinds,
-                             size_t lo, size_t hi,
-                             const Geometry *g, const Levels *levels,
-                             Stats *stats)
+/* Decode one field. Returns 1 on success, 0 on failure.
+ * The payload buffer must be allocated by the caller and be FIELD_PAYLOAD bytes. */
+static int decode_field(const float *samples, size_t n_samples,
+                        const uint32_t *starts, const int8_t *kinds,
+                        size_t lo, size_t hi,
+                        const Geometry *g, const Levels *levels,
+                        Stats *stats,
+                        uint8_t *payload)  /* pre-allocated buffer */
 {
     /* collect hsync indices */
     size_t *hs_idx = malloc((hi - lo) * sizeof(size_t));
-    if (!hs_idx) return NULL;
+    if (!hs_idx) return 0;
     size_t n_hs = 0;
     for (size_t i = lo; i < hi; i++) {
         if (kinds[i] == 1)
@@ -496,7 +504,7 @@ static uint8_t *decode_field(const float *samples, size_t n_samples,
     }
     if (n_hs < DATA_LINES / 2) {
         free(hs_idx);
-        return NULL;
+        return 0;
     }
 
     int vbi_offset = detect_field_parity(starts, kinds, hs_idx[0], g);
@@ -574,7 +582,7 @@ static uint8_t *decode_field(const float *samples, size_t n_samples,
     stats->lines_ok += ok_count;
 
     if (ok_count == 0)
-        return NULL;
+        return 0;
 
     /* de-whiten */
     for (size_t i = 0; i < FIELD_STREAM_BYTES; i++)
@@ -591,8 +599,6 @@ static uint8_t *decode_field(const float *samples, size_t n_samples,
             byte_ok[i * LINE_BYTES + b] = line_ok[i];
     }
 
-    uint8_t *payload = malloc(FIELD_PAYLOAD);
-    if (!payload) return NULL;
     size_t payload_pos = 0;
 
     for (size_t c = 0; c < CODEWORDS; c++) {
@@ -613,14 +619,14 @@ static uint8_t *decode_field(const float *samples, size_t n_samples,
             stats->symbols_corrected += corrected;
             memcpy(payload + payload_pos, out_data, RS_K);
         } else {
-            /* fallback: take systematic data portion */
-            memcpy(payload + payload_pos, codewords[c], RS_K);
+            /* Fallback: output zeroes for uncorrectable Reed-Solomon blocks */
+            memset(payload + payload_pos, 0x00, RS_K);
             stats->codewords_failed++;
         }
         payload_pos += RS_K;
     }
 
-    return payload;
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -632,6 +638,8 @@ static size_t read_chunk(FILE *f, uint8_t *buf, size_t n)
     return fread(buf, 1, n, f);
 }
 
+static const uint8_t SILENCE[FIELD_PAYLOAD] = {0};
+
 /* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
@@ -641,13 +649,40 @@ int main(int argc, char **argv)
     const char *input_path = "-";
     const char *output_path = NULL;
 
-    if (argc == 2) {
-        output_path = argv[1];
-    } else if (argc == 3) {
-        input_path  = argv[1];
-        output_path = argv[2];
+    int data_set = 0;
+    int audio_set = 0;
+
+    // 1. Parse flags
+    int i = 1;
+    while (i < argc && argv[i][0] == '-') {
+        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--data") == 0) {
+            data_set = 1;
+        } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--audio") == 0) {
+            audio_set = 1;
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            fprintf(stderr, "Usage: %s [-d|--data | -a|--audio] [<input.raw>] <output_file>\n", argv[0]);
+            return 1;
+        }
+        i++;
+    }
+
+    // 2. Validate flags and set mode
+    if (data_set && audio_set) {
+        fprintf(stderr, "Error: cannot specify both -d/--data and -a/--audio\n");
+        return 1;
+    }
+    mode = audio_set ? MODE_AUDIO : MODE_DATA;
+
+    // 3. Handle remaining positional arguments (the last one or two)
+    int remaining = argc - i;
+    if (remaining == 1) {
+        output_path = argv[argc - 1];
+    } else if (remaining == 2) {
+        input_path  = argv[argc - 2];
+        output_path = argv[argc - 1];
     } else {
-        fprintf(stderr, "Usage: %s [<input.raw>] <output_file>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [-d|--data | -a|--audio] [<input.raw>] <output_file>\n", argv[0]);
         return 1;
     }
 
@@ -698,6 +733,12 @@ int main(int argc, char **argv)
     int64_t last_processed_end = 0; /* absolute sample index */
 
     size_t LEVEL_CALIB_SAMPLES = (size_t)g.sr; /* ≈ 1 s */
+
+    uint8_t *payload = malloc(FIELD_PAYLOAD);
+    if (!payload) {
+        fprintf(stderr, "OOM\n");
+        return 1;
+    }
 
     int done = 0;
 
@@ -802,29 +843,41 @@ int main(int argc, char **argv)
             fprintf(stderr, "Field %zu\n", field_count);
             fflush(stderr);
 
-            uint8_t *payload = decode_field(buf, buf_len,
-                                            starts, kinds, lo, hi,
-                                            &g, &levels, &stats);
-            if (!payload) {
-                fprintf(stderr, "Empty\n");
-                continue;
-            }
+            int success = decode_field(buf, buf_len,
+                                      starts, kinds, lo, hi,
+                                      &g, &levels, &stats,
+                                      payload);
 
-            /* append to blob */
-            if (blob_len + FIELD_PAYLOAD > blob_cap) {
-                blob_cap = (blob_len + FIELD_PAYLOAD) * 2 + 4096;
-                uint8_t *nb = realloc(blob, blob_cap);
-                if (!nb) {
-                    free(payload);
-                    fprintf(stderr, "OOM\n");
-                    done = 1;
-                    break;
+            if (mode == MODE_AUDIO) {
+                if (success) {
+                    fwrite(payload, 1, FIELD_PAYLOAD, outf);
+                } else {
+                    /* Zero out only on whole field failure */
+                    memset(payload, 0, FIELD_PAYLOAD);
+                    fwrite(payload, 1, FIELD_PAYLOAD, outf);
                 }
-                blob = nb;
+                fflush(outf);
+                free(payload);
+            } else {
+                if (!success) {
+                    fprintf(stderr, "Field %zu failed to decode\n", field_count);
+                    memset(payload, 0, FIELD_PAYLOAD);
+                }
+
+                /* append to blob */
+                if (blob_len + FIELD_PAYLOAD > blob_cap) {
+                    blob_cap = (blob_len + FIELD_PAYLOAD) * 2 + 4096;
+                    uint8_t *nb = realloc(blob, blob_cap);
+                    if (!nb) {
+                        fprintf(stderr, "OOM\n");
+                        done = 1;
+                        break;
+                    }
+                    blob = nb;
+                }
+                memcpy(blob + blob_len, payload, FIELD_PAYLOAD);
+                blob_len += FIELD_PAYLOAD;
             }
-            memcpy(blob + blob_len, payload, FIELD_PAYLOAD);
-            blob_len += FIELD_PAYLOAD;
-            free(payload);
 
             last_processed_end = (int64_t)starts[last_idx] + g.spl;
 
@@ -924,6 +977,7 @@ int main(int argc, char **argv)
     }
 
     free(buf);
+    free(payload);
     free(blob);
     if (infile != stdin) fclose(infile);
     fclose(outf);
