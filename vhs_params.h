@@ -41,16 +41,17 @@
 /* Levels: 1.2 V full scale = 255 */
 #define V_TO_U8(v)              ((uint8_t)(((v) / 1.2) * 255.0 + 0.5))
 
-#define U8_SYNC                 V_TO_U8(0.0)     /* 0   */
-#define U8_BLANK                V_TO_U8(0.285)   /* 61  */
-#define U8_BLACK                V_TO_U8(0.339)   /* 72  */
-#define U8_BIT0                 V_TO_U8(0.30)    /* 64  */
-#define U8_BIT1                 V_TO_U8(1.00)    /* 213 */
+#define U8_SYNC                 V_TO_U8(0.0)
+#define U8_BLANK                V_TO_U8(0.285)
+#define U8_BLACK                V_TO_U8(0.339)
+#define U8_WHITE                V_TO_U8(1.0)
+#define U8_BIT0                 U8_BLACK
+#define U8_BIT1                 V_TO_U8(0.66)
 
 /* Line payload format */
 #define DATA_BITS_PER_LINE      120          /* must be divisible by 8 */
                                 // Another option for 176,400 bytes/sec is 112 bits per line, 196 RS_K, 223 RS_N
-#define PREAMBLE_BITS           12
+#define PREAMBLE_BITS           8
 #define TOTAL_BITS_PER_LINE     (PREAMBLE_BITS + DATA_BITS_PER_LINE)
 
 #if (DATA_BITS_PER_LINE % 8) != 0
@@ -64,7 +65,7 @@
 #define VBI_LINES               18  // Normally 17, but this silly VCR wastes 1 more line for WSS
 
 /* Reed-Solomon */
-#define RS_N                    202
+#define RS_N                    205
 #define RS_K                    168
 #define NSYM                    (RS_N - RS_K)   /* 32 parity symbols */
 
@@ -81,7 +82,7 @@
 
 /* Preamble: alternating 1,0,... (PREAMBLE_BITS bits) */
 static const uint8_t PREAMBLE[PREAMBLE_BITS] = {
-    1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0
+    1, 0, 1, 0, 1, 0, 1, 0
 };
 
 /*

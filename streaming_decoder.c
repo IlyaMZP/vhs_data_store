@@ -78,6 +78,48 @@ static float percentile(const float *samples, size_t n, float p)
     return res;
 }
 
+#define RESYNC_GAP_MS 20.0f
+#define LEVEL_EMA  0.04f
+
+/* Update levels from a short calibration segment.
+ * Expected content after the last data line of an even field:
+ * [(4.7, SYNC), (5.7, BLANK), (10.0, BLACK), (10.0, WHITE), (1.6, BLANK)] */
+static void levels_update_rolling(Levels *L, const float *samples, size_t n)
+{
+    if (n < 500)
+        return;
+
+    /* 1. Measure true sync tip floor and white peak.
+     * With SYNC taking ~14% of the buffer, 2% reliably lands inside SYNC. */
+    float sync_est  = percentile(samples, n, 2.0f);
+    float white_est = percentile(samples, n, 95.0f);
+
+    float span_est = white_est - sync_est;
+
+    /* 2. Reject outlier frames / noise bursts */
+    if (span_est < 8.0f)
+        return;
+
+    /* 3. Clamp step size to prevent sudden sync spikes from pulling EMA off-track */
+    float max_step = 2.0f;
+    float sync_diff = sync_est - L->sync;
+    if (sync_diff > max_step)  sync_est = L->sync + max_step;
+    if (sync_diff < -max_step) sync_est = L->sync - max_step;
+
+    float white_diff = white_est - L->white;
+    if (white_diff > max_step)  white_est = L->white + max_step;
+    if (white_diff < -max_step) white_est = L->white - max_step;
+
+    /* 4. Update EMA tracking the correct target (sync floor -> L->sync) */
+    L->sync  = (1.0f - LEVEL_EMA) * L->sync  + LEVEL_EMA * sync_est;
+    L->white = (1.0f - LEVEL_EMA) * L->white + LEVEL_EMA * white_est;
+
+    /* 5. Recalculate working thresholds */
+    float span = L->white - L->sync;
+    L->sync_threshold = L->sync + span * 0.10f;
+    L->bit_threshold  = L->sync + span * 0.51f;
+}
+
 static void levels_init(Levels *L, const float *samples, size_t n)
 {
     L->sync  = percentile(samples, n, 0.2f);
@@ -85,6 +127,16 @@ static void levels_init(Levels *L, const float *samples, size_t n)
     float span = L->white - L->sync;
     L->sync_threshold = L->sync + span * 0.10f;
     L->bit_threshold  = L->sync + span * 0.65f;
+}
+
+static void force_resync(Levels *L, const float *samples, size_t n, Geometry *g)
+{
+    levels_init(L, samples, n);
+    fprintf(stderr,
+            "[RESYNC] No pulses detected for >%.1fms. Recalibrated levels: "
+            "sync=%.1f white=%.1f sync_th=%.1f bit_th=%.1f\n",
+            RESYNC_GAP_MS, L->sync, L->white, L->sync_threshold, L->bit_threshold);
+    fflush(stderr);
 }
 
 /* ------------------------------------------------------------------ */
@@ -281,7 +333,7 @@ static int decode_line(const float *samples, size_t n_samples,
         if (edges[i] < pre_lim)
             pre[n_pre++] = edges[i];
     }
-    if (n_pre < 10) {
+    if (n_pre < PREAMBLE_BITS-2) {
         free(sm); free(edges); free(pre);
         return 0;
     }
@@ -340,7 +392,7 @@ static int decode_line(const float *samples, size_t n_samples,
     med_abs = resid[n_pre / 2];
 
     free(pre); free(resid);
-    if (med_abs > 0.30f * spb || unique_k < 10) {
+    if (med_abs > 0.30f * spb || unique_k < PREAMBLE_BITS-2) {
         free(sm); free(edges);
         return 0;
     }
@@ -485,14 +537,13 @@ typedef struct {
     size_t codewords_failed;
 } Stats;
 
-/* Decode one field. Returns 1 on success, 0 on failure.
- * The payload buffer must be allocated by the caller and be FIELD_PAYLOAD bytes. */
+/* Decode one field. On success returns a newly allocated FIELD_PAYLOAD-byte
+ * buffer (caller frees); on failure returns NULL. */
 static int decode_field(const float *samples, size_t n_samples,
-                        const uint32_t *starts, const int8_t *kinds,
-                        size_t lo, size_t hi,
-                        const Geometry *g, const Levels *levels,
-                        Stats *stats,
-                        uint8_t *payload)  /* pre-allocated buffer */
+                             const uint32_t *starts, const int8_t *kinds,
+                             size_t lo, size_t hi,
+                             const Geometry *g, Levels *levels,
+                             Stats *stats, uint8_t *payload)
 {
     /* collect hsync indices */
     size_t *hs_idx = malloc((hi - lo) * sizeof(size_t));
@@ -557,13 +608,40 @@ static int decode_field(const float *samples, size_t n_samples,
             prev = s;
         }
 
-        int data_idx = n - vbi_offset;
+        /*int data_idx = n - vbi_offset;
         if (data_idx < 0 || data_idx >= DATA_LINES || line_ok[data_idx])
             continue;
 
         uint32_t nxt = (j + 1 < n_hs) ? starts[hs_idx[j + 1]]
                                       : (uint32_t)(s + P);
+        float ratio = (float)((double)(nxt - s) / g->spl);*/
+        int data_idx = n - vbi_offset;
+        // Allow exactly one line past the data lines to process the calibration half-line
+        if (data_idx < 0 || data_idx > DATA_LINES)
+            continue;
+
+        uint32_t nxt = (j + 1 < n_hs) ? starts[hs_idx[j + 1]]
+                                      : (uint32_t)(s + P);
         float ratio = (float)((double)(nxt - s) / g->spl);
+
+        if (data_idx == DATA_LINES) {
+            /* Calibration half-line in even field */
+            if (vbi_offset == VBI_LINES - 1 && n_hs >= 1) {
+                // Calculate total samples corresponding to the 32 µs (0.5 * full line duration)
+                size_t cal_len = (size_t)lround(0.5 * g->spl * ratio);
+
+                // Ensure we do not read beyond the input buffer boundaries
+                if (s < n_samples) {
+                    size_t n_avail = n_samples - s;
+                    if (cal_len > n_avail) {
+                        cal_len = n_avail;
+                    }
+                    levels_update_rolling(levels, samples + s, cal_len);
+                }
+            }
+            continue;
+        }
+
         if (!(0.95f < ratio && ratio < 1.05f))
             ratio = (float)(P / g->spl);
 
@@ -598,7 +676,6 @@ static int decode_field(const float *samples, size_t n_samples,
         for (int b = 0; b < LINE_BYTES; b++)
             byte_ok[i * LINE_BYTES + b] = line_ok[i];
     }
-
     size_t payload_pos = 0;
 
     for (size_t c = 0; c < CODEWORDS; c++) {
@@ -619,6 +696,7 @@ static int decode_field(const float *samples, size_t n_samples,
             stats->symbols_corrected += corrected;
             memcpy(payload + payload_pos, out_data, RS_K);
         } else {
+            //printf("SILENCE!\n");
             /* Fallback: output zeroes for uncorrectable Reed-Solomon blocks */
             memset(payload + payload_pos, 0x00, RS_K);
             stats->codewords_failed++;
@@ -729,6 +807,8 @@ int main(int argc, char **argv)
     size_t written = 0;
     size_t field_count = 0;
     int64_t last_processed_end = 0; /* absolute sample index */
+    uint32_t max_gap_samples = us_to_samples(g.sr, RESYNC_GAP_MS * 1000.0f);
+    size_t samples_since_last_pulse = 0;
 
     size_t LEVEL_CALIB_SAMPLES = (size_t)g.sr; /* ≈ 1 s */
 
@@ -789,6 +869,15 @@ int main(int argc, char **argv)
                     levels.sync, levels.white,
                     levels.sync_threshold, levels.bit_threshold);
             fflush(stderr);
+        } else {
+        	if ((levels.white - levels.sync) < 8.0f) {
+                usleep(500000);
+                buf_len = 0;
+                last_processed_end = 0;
+                samples_since_last_pulse = 0;
+                levels_ready = 0;
+	            continue;
+	        }
         }
         /* ---- detect pulses ---- */
         uint32_t *starts = NULL, *ends = NULL;
@@ -796,19 +885,38 @@ int main(int argc, char **argv)
                                         &starts, &ends);
         n_pulses = clean_pulses(&starts, &ends, n_pulses, &g);
 
-        if (n_pulses == 0) {
+       if (n_pulses == 0) {
             free(starts); free(ends);
-            if (nread == 0) break;
-            /* discard oldest part */
-            if (buf_len > WINDOW_SAMPLES + OVERLAP_SAMPLES) {
-                size_t drop = buf_len - WINDOW_SAMPLES;
-                memmove(buf, buf + drop, (buf_len - drop) * sizeof(float));
-                buf_len -= drop;
-                last_processed_end = last_processed_end > (int64_t)drop
-                                     ? last_processed_end - drop : 0;
+
+            samples_since_last_pulse += need; /* accumulate missing sample span */
+
+            /* Check if the gap since the last valid pulse exceeds 20 ms */
+            if (levels_ready && samples_since_last_pulse >= max_gap_samples) {
+                force_resync(&levels, buf, buf_len, &g);
+                samples_since_last_pulse = 0; /* reset gap counter */
+
+                /* Rerun pulse detection immediately with new thresholds */
+                n_pulses = detect_pulses(buf, buf_len, levels.sync_threshold, &starts, &ends);
+                n_pulses = clean_pulses(&starts, &ends, n_pulses, &g);
             }
-            continue;
+
+            /* If second pass still found no pulses, slide window normally */
+            if (n_pulses == 0) {
+                if (nread == 0) break;
+
+                if (buf_len > WINDOW_SAMPLES + OVERLAP_SAMPLES) {
+                    size_t drop = buf_len - WINDOW_SAMPLES;
+                    memmove(buf, buf + drop, (buf_len - drop) * sizeof(float));
+                    buf_len -= drop;
+                    last_processed_end = last_processed_end > (int64_t)drop
+                                         ? last_processed_end - drop : 0;
+                }
+                continue;
+            }
         }
+
+        /* Account for samples up to the start of the first pulse, then reset gap counter */
+        samples_since_last_pulse = buf_len - ends[n_pulses - 1];
 
         int8_t *kinds = malloc(n_pulses * sizeof(int8_t));
         if (!kinds) {
@@ -838,30 +946,19 @@ int main(int argc, char **argv)
                 continue; /* not fully inside safe region */
 
             field_count++;
-            fprintf(stderr, "Field %zu\n", field_count);
-            fflush(stderr);
+            //fprintf(stderr, "Field %zu\n", field_count);
+            //fflush(stderr);
 
-            int success = decode_field(buf, buf_len,
-                                      starts, kinds, lo, hi,
-                                      &g, &levels, &stats,
-                                      payload);
-
+            int success = decode_field(buf, buf_len, starts, kinds, lo, hi,
+                                       &g, &levels, &stats, payload);
+            if (!success) {
+                memset(payload, 0, FIELD_PAYLOAD);
+                printf("Field skip!\n");
+            }
             if (mode == MODE_AUDIO) {
-                if (success) {
-                    fwrite(payload, 1, FIELD_PAYLOAD, outf);
-                } else {
-                    /* Zero out only on whole field failure */
-                    memset(payload, 0, FIELD_PAYLOAD);
-                    fwrite(payload, 1, FIELD_PAYLOAD, outf);
-                }
+                fwrite(payload, 1, FIELD_PAYLOAD, outf);
                 fflush(outf);
-                free(payload);
             } else {
-                if (!success) {
-                    fprintf(stderr, "Field %zu failed to decode\n", field_count);
-                    memset(payload, 0, FIELD_PAYLOAD);
-                }
-
                 /* append to blob */
                 if (blob_len + FIELD_PAYLOAD > blob_cap) {
                     blob_cap = (blob_len + FIELD_PAYLOAD) * 2 + 4096;

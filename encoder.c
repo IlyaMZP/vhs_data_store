@@ -124,13 +124,29 @@ static void lw_init(LineWriter *lw, const Geometry *g)
     memset(lw->half_line_blank, U8_BLANK, g->half);
 
     lw->half_line_hsync = xmalloc(g->half);
-    memset(lw->half_line_hsync, U8_BLANK, g->half);
-    memset(lw->half_line_hsync, U8_SYNC, g->hsync);
-    /* active region up to -pad (Python: g.active_off:-g.pad) */
-    if (g->half > g->active_off + g->pad) {
-        size_t len = g->half - g->active_off - g->pad;
-        memset(lw->half_line_hsync + g->active_off, U8_BLACK, len);
-    }
+    size_t pos = 0;
+    size_t len;
+
+    /* [(4.7, SYNC), (5.7, BLANK), (10.0, BLACK), (10.0, WHITE), (1.6, BLANK)]  == 32 µs */
+    len = us_to_samples(g->sr, 4.7);          /* or simply g->hsync if HSYNC_US == 4.7 */
+    memset(lw->half_line_hsync + pos, U8_SYNC, len);
+    pos += len;
+
+    len = us_to_samples(g->sr, 5.7);
+    memset(lw->half_line_hsync + pos, U8_BLANK, len);
+    pos += len;
+
+    len = us_to_samples(g->sr, 10.0);
+    memset(lw->half_line_hsync + pos, U8_BLACK, len);
+    pos += len;
+
+    len = us_to_samples(g->sr, 10.0);
+    memset(lw->half_line_hsync + pos, U8_WHITE, len);
+    pos += len;
+
+    /* remainder absorbs any rounding error so the buffer is always exactly g->half */
+    len = g->half - pos;
+    memset(lw->half_line_hsync + pos, U8_BLANK, len);
 
     lw->data_tmpl = xmalloc(g->spl);
     memcpy(lw->data_tmpl, lw->blank_line, g->spl);
@@ -256,7 +272,7 @@ int main(int argc, char **argv)
         input_path  = argv[argc - 2];
         output_path = argv[argc - 1];
     } else {
-        fprintf(stderr, "usage: encode <input_file> <output.raw>\n", argv[0]);
+        fprintf(stderr, "usage: %s <input_file> <output.raw>\n", argv[0]);
         return 1;
     }
 
