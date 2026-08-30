@@ -79,7 +79,7 @@ static float percentile(const float *samples, size_t n, float p)
 }
 
 #define RESYNC_GAP_MS 20.0f
-#define LEVEL_EMA  0.04f
+#define LEVEL_EMA  0.08f
 
 /* Update levels from a short calibration segment.
  * Expected content after the last data line of an even field:
@@ -101,7 +101,7 @@ static void levels_update_rolling(Levels *L, const float *samples, size_t n)
         return;
 
     /* 3. Clamp step size to prevent sudden sync spikes from pulling EMA off-track */
-    float max_step = 2.0f;
+    float max_step = 15.0f;
     float sync_diff = sync_est - L->sync;
     if (sync_diff > max_step)  sync_est = L->sync + max_step;
     if (sync_diff < -max_step) sync_est = L->sync - max_step;
@@ -810,7 +810,7 @@ int main(int argc, char **argv)
     uint32_t max_gap_samples = us_to_samples(g.sr, RESYNC_GAP_MS * 1000.0f);
     size_t samples_since_last_pulse = 0;
 
-    size_t LEVEL_CALIB_SAMPLES = (size_t)g.sr; /* ≈ 1 s */
+    size_t LEVEL_CALIB_SAMPLES = us_to_samples(g.sr, 20 * 1000.0f);
 
     uint8_t *payload = malloc(FIELD_PAYLOAD);
     if (!payload) {
