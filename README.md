@@ -4,7 +4,7 @@ Store digita data on VHS tapes using software and fl2k (DAC) and cxadc (ADC)
 ## Demo
 Here is a [Video](https://mango.vg/files/vhs.mp4) of RAW PCM audio (CD quality) being played directly from tape. \
 At this speed on my setup the error correction is not perfect, but good enough for PCM. \
-80-100 bits per line is way more resilient.
+80-100 bits per line is way more resilient. For audio mode use `-a/--audio`, which disables header and CRC check for continious decoding.
 
 ## Build
 ```bash
@@ -21,7 +21,7 @@ make
 cat output.u8 | ./streaming_decoder - output.txt
 ```
 
-Currently the encoder doesn't pad the useful data, so direct round trip will fail. \
+Currently the encoder doesn't pad the useful data, so direct round trip in data mode (-d/--data - default) will fail. \
 You can generate a pad file with `PAL-generator.py` with some image and simply concatenate them. \
 Because `streaming_decoder` only calibrates levels in the beginning, you should use an image with good contrast.
 
