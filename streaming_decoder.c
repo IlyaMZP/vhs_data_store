@@ -1,14 +1,3 @@
-/*
- * decode.c – Decode a data file from a PAL composite video signal (8-bit raw samples).
- *
- * Streaming version: reads continuously from stdin (or a file), processes in
- * overlapping windows, and stops once the MAGIC header has been found and the
- * declared payload length has been written.
- *
- * Usage: ./decode [<input.raw>] <output_file>
- *        (omit input or use "-" to read from stdin)
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,19 +16,14 @@ typedef enum {
 
 Mode mode = MODE_DATA;
 
-/* ------------------------------------------------------------------ */
-/* DPLL tracking gains (early-late gate)                               */
-/* ------------------------------------------------------------------ */
-#define ALPHA  0.12f   /* phase */
-#define BETA   0.015f  /* frequency */
+// DPLL tracking gains (early-late gate)
+#define ALPHA  0.12f   // phase
+#define BETA   0.015f  // frequency
 
-/* Streaming parameters */
-#define WINDOW_SAMPLES     2000000u   /* ~50 ms @ 40 MHz */
+// Streaming parameters
+#define WINDOW_SAMPLES     2000000u   // ~50 ms @ 40 MHz
 #define OVERLAP_SAMPLES    200000u
 
-/* ------------------------------------------------------------------ */
-/* Levels                                                              */
-/* ------------------------------------------------------------------ */
 typedef struct {
     float sync;
     float white;
@@ -54,8 +38,6 @@ static int cmp_float(const void *a, const void *b)
     return (fa > fb) - (fa < fb);
 }
 
-/* Exact percentile (linear interpolation), O(n log n).
- * Called only once during level calibration. */
 static float percentile(const float *samples, size_t n, float p)
 {
     if (n == 0)
@@ -81,26 +63,26 @@ static float percentile(const float *samples, size_t n, float p)
 #define RESYNC_GAP_MS 20.0f
 #define LEVEL_EMA  0.08f
 
-/* Update levels from a short calibration segment.
- * Expected content after the last data line of an even field:
- * [(4.7, SYNC), (5.7, BLANK), (10.0, BLACK), (10.0, WHITE), (1.6, BLANK)] */
+// Update levels from a short calibration segment.
+// Expected content after the last data line of an even field:
+// [(4.7, SYNC), (5.7, BLANK), (10.0, BLACK), (10.0, WHITE), (1.6, BLANK)]
 static void levels_update_rolling(Levels *L, const float *samples, size_t n)
 {
     if (n < 500)
         return;
 
-    /* 1. Measure true sync tip floor and white peak.
-     * With SYNC taking ~14% of the buffer, 2% reliably lands inside SYNC. */
+    // Measure true sync tip floor and white peak.
+    // With SYNC taking ~14% of the buffer, 2% reliably lands inside SYNC.
     float sync_est  = percentile(samples, n, 2.0f);
     float white_est = percentile(samples, n, 95.0f);
 
     float span_est = white_est - sync_est;
 
-    /* 2. Reject outlier frames / noise bursts */
+    // Reject outlier frames / noise bursts
     if (span_est < 8.0f)
         return;
 
-    /* 3. Clamp step size to prevent sudden sync spikes from pulling EMA off-track */
+    // Clamp step size to prevent sudden sync spikes from pulling EMA off-track
     float max_step = 15.0f;
     float sync_diff = sync_est - L->sync;
     if (sync_diff > max_step)  sync_est = L->sync + max_step;
@@ -110,14 +92,14 @@ static void levels_update_rolling(Levels *L, const float *samples, size_t n)
     if (white_diff > max_step)  white_est = L->white + max_step;
     if (white_diff < -max_step) white_est = L->white - max_step;
 
-    /* 4. Update EMA tracking the correct target (sync floor -> L->sync) */
+    // Update EMA tracking the correct target (sync floor -> L->sync)
     L->sync  = (1.0f - LEVEL_EMA) * L->sync  + LEVEL_EMA * sync_est;
     L->white = (1.0f - LEVEL_EMA) * L->white + LEVEL_EMA * white_est;
 
-    /* 5. Recalculate working thresholds */
+    // Recalculate working thresholds
     float span = L->white - L->sync;
     L->sync_threshold = L->sync + span * 0.10f;
-    L->bit_threshold  = L->sync + span * 0.51f;
+    L->bit_threshold  = L->sync + span * 0.47f;
 }
 
 static void levels_init(Levels *L, const float *samples, size_t n)
@@ -139,12 +121,8 @@ static void force_resync(Levels *L, const float *samples, size_t n, Geometry *g)
     fflush(stderr);
 }
 
-/* ------------------------------------------------------------------ */
-/* Pulse detection / cleaning / classification                         */
-/* ------------------------------------------------------------------ */
-
-/* Returns number of pulses written into starts[]/ends[].
- * Caller must free the arrays. */
+// Returns number of pulses written into starts[]/ends[].
+// Caller must free the arrays.
 static size_t detect_pulses(const float *samples, size_t n,
                             float threshold,
                             uint32_t **starts_out, uint32_t **ends_out)
@@ -155,7 +133,7 @@ static size_t detect_pulses(const float *samples, size_t n,
         return 0;
     }
 
-    /* first pass: count transitions */
+    // first pass: count transitions
     size_t n_start = 0, n_end = 0;
     int prev_below = samples[0] < threshold;
     for (size_t i = 1; i < n; i++) {
@@ -182,7 +160,7 @@ static size_t detect_pulses(const float *samples, size_t n,
         prev_below = below;
     }
 
-    /* drop leading end that precedes first start */
+    // drop leading end that precedes first start
     size_t e_off = 0;
     if (ei > 0 && si > 0 && ends[0] <= starts[0])
         e_off = 1;
@@ -197,8 +175,8 @@ static size_t detect_pulses(const float *samples, size_t n,
     return n_pulses;
 }
 
-/* Merge pulses split by noise (gap < 1 us) and drop spikes < 1.2 us.
- * Returns new count; arrays are reallocated / updated in place. */
+// Merge pulses split by noise (gap < 1 us) and drop spikes < 1.2 us.
+// Returns new count; arrays are reallocated / updated in place.
 static size_t clean_pulses(uint32_t **starts, uint32_t **ends, size_t n,
                            const Geometry *g)
 {
@@ -207,7 +185,7 @@ static size_t clean_pulses(uint32_t **starts, uint32_t **ends, size_t n,
     uint32_t gap_min = us_to_samples(g->sr, 1.0);
     uint32_t width_min = us_to_samples(g->sr, 1.2);
 
-    /* merge */
+    // merge
     uint32_t *s = malloc(n * sizeof(uint32_t));
     uint32_t *e = malloc(n * sizeof(uint32_t));
     if (!s || !e) { free(s); free(e); return 0; }
@@ -217,7 +195,7 @@ static size_t clean_pulses(uint32_t **starts, uint32_t **ends, size_t n,
     e[0] = (*ends)[0];
     for (size_t i = 1; i < n; i++) {
         if ((*starts)[i] - e[m] < gap_min) {
-            /* merge into current */
+            // merge into current
             e[m] = (*ends)[i];
         } else {
             m++;
@@ -225,9 +203,9 @@ static size_t clean_pulses(uint32_t **starts, uint32_t **ends, size_t n,
             e[m] = (*ends)[i];
         }
     }
-    m++; /* number of merged segments */
+    m++; // number of merged segments
 
-    /* drop narrow spikes */
+    // drop narrow spikes
     size_t k = 0;
     for (size_t i = 0; i < m; i++) {
         if (e[i] - s[i] >= width_min) {
@@ -244,7 +222,7 @@ static size_t clean_pulses(uint32_t **starts, uint32_t **ends, size_t n,
     return k;
 }
 
-/* 0 = short, 1 = hsync, 2 = broad */
+// 0 = short, 1 = hsync, 2 = broad
 static void classify(const uint32_t *starts, const uint32_t *ends, size_t n,
                      const Geometry *g, int8_t *kinds)
 {
@@ -261,11 +239,8 @@ static void classify(const uint32_t *starts, const uint32_t *ends, size_t n,
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Line decoder (TBC + preamble lock + early-late DPLL)                */
-/* ------------------------------------------------------------------ */
-
-/* Returns 1 on success and writes LINE_BYTES into out[]; 0 on failure. */
+// Line decoder (TBC + preamble search + early-late DPLL)
+// Returns 1 on success and writes LINE_BYTES into out[]; 0 on failure.
 static int decode_line(const float *samples, size_t n_samples,
                        uint32_t start, float ratio,
                        const Geometry *g, const Levels *levels,
@@ -283,11 +258,11 @@ static int decode_line(const float *samples, size_t n_samples,
     size_t raw_len = (size_t)ext_len;
     size_t grid_len = g->pad + g->active;
 
-    /* linear resample to nominal grid (per-line TBC) */
+    // linear resample to nominal grid (per-line TBC)
     float *tbc = malloc(grid_len * sizeof(float));
     if (!tbc) return 0;
     for (size_t i = 0; i < grid_len; i++) {
-        float t = (float)i / (float)(grid_len - 1);          /* 0..1 */
+        float t = (float)i / (float)(grid_len - 1);          // 0..1
         float src = t * (raw_len - 1);
         size_t lo = (size_t)floorf(src);
         size_t hi = lo + 1 < raw_len ? lo + 1 : lo;
@@ -295,7 +270,7 @@ static int decode_line(const float *samples, size_t n_samples,
         tbc[i] = raw[lo] * (1.0f - frac) + raw[hi] * frac;
     }
 
-    /* light 3-tap box smooth */
+    // light 3-tap box smooth
     float *sm = malloc(grid_len * sizeof(float));
     if (!sm) { free(tbc); return 0; }
     for (size_t i = 0; i < grid_len; i++) {
@@ -307,7 +282,7 @@ static int decode_line(const float *samples, size_t n_samples,
     }
     free(tbc);
 
-    /* binarize + edge positions (mid-sample) */
+    // binarize + edge positions (mid-sample)
     uint8_t *binar = malloc(grid_len);
     if (!binar) { free(sm); return 0; }
     for (size_t i = 0; i < grid_len; i++)
@@ -324,19 +299,19 @@ static int decode_line(const float *samples, size_t n_samples,
 
     float spb = (float)g->nominal_spb;
 
-/* 1. Find the first true rising edge of the preamble clock run-in.
-     * We look near g->pad for the low-to-high transition where clock oscillation starts. */
+    // Find the first true rising edge of the preamble clock run-in.
+    // We look near g->pad for the low-to-high transition where clock oscillation starts.
     float expected_start = g->pad;
     float start_edge = -1.0f;
     float min_dist = 1e9f;
 
     for (size_t i = 1; i < grid_len; i++) {
-        /* Detect rising edge (Low -> High transition across threshold) */
+        // Detect rising edge (Low -> High transition across threshold)
         if (sm[i - 1] <= levels->bit_threshold && sm[i] > levels->bit_threshold) {
             float edge_pos = (float)i - 0.5f;
             float dist = fabsf(edge_pos - expected_start);
 
-            /* Restrict to plausible preamble window (within +/- 1.5 SPB of pad) */
+            // Restrict to plausible preamble window (within +/- 1.5 SPB of pad)
             if (dist < 1.5f * spb && dist < min_dist) {
                 min_dist = dist;
                 start_edge = edge_pos;
@@ -344,13 +319,14 @@ static int decode_line(const float *samples, size_t n_samples,
         }
     }
 
-    /* Fallback if edge search fails completely */
+    // Fallback if edge search fails completely
+    // TODO: we should fallback to a stored value from a previous successfully decoded line
     if (start_edge < 0.0f) {
         start_edge = g->pad;
     }
 
-    /* 2. Candidate evaluation: slide start offset by [-1, 0, +1] bit cycles
-     * and select the offset that best matches the known preamble pattern. */
+    // 2. Candidate evaluation: slide start offset by [-1, 0, +1] bit cycles
+    // and select the offset that best matches the known preamble pattern.
     int best_shift = 0;
     float max_correlation = -1e9f;
 
@@ -358,12 +334,12 @@ static int decode_line(const float *samples, size_t n_samples,
         float test_center = start_edge + (0.5f + shift) * spb;
         float correlation = 0.0f;
 
-        /* Preamble bits alternate: 1, 0, 1, 0... ending in 1, 0 */
+        // Preamble bits alternate: 1, 0, 1, 0... ending in 1, 0
         for (int b = 0; b < PREAMBLE_BITS; b++) {
             int sample_idx = (int)lroundf(test_center + b * spb);
             if (sample_idx >= 0 && sample_idx < (int)grid_len) {
                 float val = sm[sample_idx] - levels->bit_threshold;
-                /* Expected preamble pattern: even bits high (>0), odd bits low (<0) */
+                // Expected preamble pattern: even bits high (>0), odd bits low (<0)
                 float expected_sign = (b % 2 == 0) ? 1.0f : -1.0f;
                 correlation += val * expected_sign;
             }
@@ -375,10 +351,8 @@ static int decode_line(const float *samples, size_t n_samples,
         }
     }
 
-    /* 3. Final DPLL alignment */
     float aligned_start = start_edge + best_shift * spb;
-
-    /* Center position for bit 0 of DATA */
+    // Center position for bit 0 after PREAMBLE
     float center = aligned_start + (PREAMBLE_BITS + 0.5f) * spb;
 
     uint8_t bits[DATA_BITS_PER_LINE];
@@ -400,7 +374,7 @@ static int decode_line(const float *samples, size_t n_samples,
         float expected_edge = center + 0.5f * spb;
         center += spb;
 
-        /* find edges in [expected - 0.35*spb, expected + 0.35*spb] */
+        // find edges in [expected - 0.35*spb, expected + 0.35*spb]
         float win_lo = expected_edge - 0.35f * spb;
         float win_hi = expected_edge + 0.35f * spb;
         float best_err = 0.0f;
@@ -425,7 +399,7 @@ static int decode_line(const float *samples, size_t n_samples,
     if (!(0.9f * g->nominal_spb < spb && spb < 1.1f * g->nominal_spb))
         return 0;
 
-    /* pack bits MSB first (matches np.packbits default) */
+    // pack bits MSB first (matches np.packbits default)
     for (int i = 0; i < LINE_BYTES; i++) {
         uint8_t b = 0;
         for (int j = 0; j < 8; j++)
@@ -435,15 +409,11 @@ static int decode_line(const float *samples, size_t n_samples,
     return 1;
 }
 
-/* ------------------------------------------------------------------ */
-/* Field splitting / parity / decode                                   */
-/* ------------------------------------------------------------------ */
-
 typedef struct {
-    size_t lo, hi;   /* pulse index range [lo, hi) of the field body */
+    size_t lo, hi;   // pulse index range [lo, hi) of the field body
 } FieldRange;
 
-/* Collect field body ranges. Returns count; caller frees the array. */
+// Collect field body ranges. Returns count; caller frees the array.
 static size_t split_fields(const int8_t *kinds, size_t n, FieldRange **out)
 {
     FieldRange *fields = NULL;
@@ -481,11 +451,11 @@ static size_t split_fields(const int8_t *kinds, size_t n, FieldRange **out)
     return n_fields;
 }
 
-/* Returns VBI offset: 17 (odd) or 16 (even) */
+// Returns VBI offset: 17 (odd) or 16 (even)
 static int detect_field_parity(const uint32_t *starts, const int8_t *kinds,
                                size_t lo, const Geometry *g)
 {
-    /* last eq/broad before lo */
+    // last eq/broad before lo
     int prev = -1;
     size_t from = lo > 15 ? lo - 15 : 0;
     for (size_t i = from; i < lo; i++) {
@@ -496,13 +466,13 @@ static int detect_field_parity(const uint32_t *starts, const int8_t *kinds,
 
     uint32_t gap = starts[lo] - starts[prev];
     if (gap < (uint32_t)(0.75 * g->spl))
-        return VBI_LINES;       /* odd */
+        return VBI_LINES;       // odd
     else
-        return VBI_LINES - 1;   /* even */
+        return VBI_LINES - 1;   // even
 }
 
-/* De-interleave: stream[FIELD_STREAM_BYTES] -> codewords[CODEWORDS][RS_N]
- * Only the first CODED_BYTES of stream are used. */
+// De-interleave: stream[FIELD_STREAM_BYTES] -> codewords[CODEWORDS][RS_N]
+// Only the first CODED_BYTES of stream are used.
 static void deinterleave(const uint8_t *stream, uint8_t codewords[CODEWORDS][RS_N])
 {
     for (size_t s = 0; s < CODED_BYTES; s++) {
@@ -519,15 +489,15 @@ typedef struct {
     size_t codewords_failed;
 } Stats;
 
-/* Decode one field. On success returns a newly allocated FIELD_PAYLOAD-byte
- * buffer (caller frees); on failure returns NULL. */
+// Decode one field. On success returns a newly allocated FIELD_PAYLOAD-byte
+// buffer (caller frees); on failure returns NULL.
 static int decode_field(const float *samples, size_t n_samples,
                              const uint32_t *starts, const int8_t *kinds,
                              size_t lo, size_t hi,
                              const Geometry *g, Levels *levels,
                              Stats *stats, uint8_t *payload)
 {
-    /* collect hsync indices */
+    // collect hsync indices
     size_t *hs_idx = malloc((hi - lo) * sizeof(size_t));
     if (!hs_idx) return 0;
     size_t n_hs = 0;
@@ -542,7 +512,7 @@ static int decode_field(const float *samples, size_t n_samples,
 
     int vbi_offset = detect_field_parity(starts, kinds, hs_idx[0], g);
 
-    /* median line period from plausible diffs */
+    // median line period from plausible diffs
     double P = (double)g->spl;
     if (n_hs >= 2) {
         double *diffs = malloc((n_hs - 1) * sizeof(double));
@@ -553,7 +523,7 @@ static int decode_field(const float *samples, size_t n_samples,
                 diffs[n_plaus++] = d;
         }
         if (n_plaus) {
-            /* median */
+            // median
             for (size_t i = 1; i < n_plaus; i++) {
                 double key = diffs[i];
                 size_t j = i;
@@ -581,7 +551,7 @@ static int decode_field(const float *samples, size_t n_samples,
         if (j > 0) {
             double d = (double)s - prev;
             if (d < 0.5 * P)
-                continue; /* spurious */
+                continue; // spurious
             int k = (int)lround(d / P);
             if (k < 1) k = 1;
             n += k;
@@ -590,13 +560,6 @@ static int decode_field(const float *samples, size_t n_samples,
             prev = s;
         }
 
-        /*int data_idx = n - vbi_offset;
-        if (data_idx < 0 || data_idx >= DATA_LINES || line_ok[data_idx])
-            continue;
-
-        uint32_t nxt = (j + 1 < n_hs) ? starts[hs_idx[j + 1]]
-                                      : (uint32_t)(s + P);
-        float ratio = (float)((double)(nxt - s) / g->spl);*/
         int data_idx = n - vbi_offset;
         // Allow exactly one line past the data lines to process the calibration half-line
         if (data_idx < 0 || data_idx > DATA_LINES)
@@ -607,7 +570,7 @@ static int decode_field(const float *samples, size_t n_samples,
         float ratio = (float)((double)(nxt - s) / g->spl);
 
         if (data_idx == DATA_LINES) {
-            /* Calibration half-line in even field */
+            // Calibration half-line in even field
             if (vbi_offset == VBI_LINES - 1 && n_hs >= 1) {
                 // Calculate total samples corresponding to the 32 µs (0.5 * full line duration)
                 size_t cal_len = (size_t)lround(0.5 * g->spl * ratio);
@@ -644,15 +607,15 @@ static int decode_field(const float *samples, size_t n_samples,
     if (ok_count == 0)
         return 0;
 
-    /* de-whiten */
+    // de-whiten
     for (size_t i = 0; i < FIELD_STREAM_BYTES; i++)
         stream[i] ^= whitening_bytes[i];
 
-    /* de-interleave */
+    // de-interleave
     uint8_t codewords[CODEWORDS][RS_N];
     deinterleave(stream, codewords);
 
-    /* per-symbol validity (line-level erasure) */
+    // per-symbol validity (line-level erasure)
     uint8_t byte_ok[FIELD_STREAM_BYTES];
     for (int i = 0; i < DATA_LINES; i++) {
         for (int b = 0; b < LINE_BYTES; b++)
@@ -678,8 +641,8 @@ static int decode_field(const float *samples, size_t n_samples,
             stats->symbols_corrected += corrected;
             memcpy(payload + payload_pos, out_data, RS_K);
         } else {
-            //printf("SILENCE!\n");
-            /* Fallback: output zeroes for uncorrectable Reed-Solomon blocks */
+            // printf("SILENCE!\n");
+            // Fallback: output zeroes for uncorrectable Reed-Solomon blocks
             memset(payload + payload_pos, 0x00, RS_K);
             stats->codewords_failed++;
         }
@@ -689,18 +652,10 @@ static int decode_field(const float *samples, size_t n_samples,
     return 1;
 }
 
-/* ------------------------------------------------------------------ */
-/* Streaming I/O helpers                                               */
-/* ------------------------------------------------------------------ */
-
-static size_t read_chunk(FILE *f, uint8_t *buf, size_t n)
+static inline size_t read_chunk(FILE *f, uint8_t *buf, size_t n)
 {
     return fread(buf, 1, n, f);
 }
-
-/* ------------------------------------------------------------------ */
-/* main                                                                */
-/* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv)
 {
@@ -710,7 +665,7 @@ int main(int argc, char **argv)
     int data_set = 0;
     int audio_set = 0;
 
-    // 1. Parse flags
+    // Parse flags only
     int i = 1;
     while (i < argc && argv[i][0] == '-') {
         if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--data") == 0) {
@@ -725,14 +680,13 @@ int main(int argc, char **argv)
         i++;
     }
 
-    // 2. Validate flags and set mode
     if (data_set && audio_set) {
         fprintf(stderr, "Error: cannot specify both -d/--data and -a/--audio\n");
         return 1;
     }
     mode = audio_set ? MODE_AUDIO : MODE_DATA;
 
-    // 3. Handle remaining positional arguments (the last one or two)
+    // Parse remaining positional arguments (input/output files)
     int remaining = argc - i;
     if (remaining == 1) {
         output_path = argv[argc - 1];
@@ -769,7 +723,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* rolling sample buffer (float) */
+    // rolling sample buffer
     size_t buf_cap = WINDOW_SAMPLES + OVERLAP_SAMPLES + 100000;
     float *buf = malloc(buf_cap * sizeof(float));
     if (!buf) {
@@ -787,8 +741,8 @@ int main(int argc, char **argv)
     uint32_t payload_length = 0;
     uint32_t expected_crc = 0;
     size_t written = 0;
-    size_t field_count = 0;
-    int64_t last_processed_end = 0; /* absolute sample index */
+    //size_t field_count = 0; // This is unused, but I keep it for debug purposes
+    int64_t last_processed_end = 0; // absolute sample index
     uint32_t max_gap_samples = us_to_samples(g.sr, RESYNC_GAP_MS * 1000.0f);
     size_t samples_since_last_pulse = 0;
 
@@ -803,7 +757,7 @@ int main(int argc, char **argv)
     int done = 0;
 
     while (!done) {
-        /* ---- fill rolling buffer ---- */
+        // fill the rolling buffer
         size_t need;
         if (buf_len > OVERLAP_SAMPLES)
             need = WINDOW_SAMPLES - (buf_len - OVERLAP_SAMPLES);
@@ -811,7 +765,7 @@ int main(int argc, char **argv)
             need = WINDOW_SAMPLES;
         if (need <= 0) need = WINDOW_SAMPLES / 2;
         if (need > buf_cap - buf_len) {
-            /* grow */
+            // grow
             buf_cap = buf_len + need + 100000;
             float *nb = realloc(buf, buf_cap * sizeof(float));
             if (!nb) { fprintf(stderr, "OOM\n"); break; }
@@ -831,7 +785,7 @@ int main(int argc, char **argv)
         }
         free(raw_chunk);
 
-        /* ---- calibrate levels once ---- */
+        // calibrate levels once
         if (!levels_ready) {
             size_t need_calib = LEVEL_CALIB_SAMPLES < 100000 ? LEVEL_CALIB_SAMPLES : 100000;
             if (buf_len < need_calib) {
@@ -852,37 +806,37 @@ int main(int argc, char **argv)
                     levels.sync_threshold, levels.bit_threshold);
             fflush(stderr);
         } else {
-        	if ((levels.white - levels.sync) < 8.0f) {
+            if ((levels.white - levels.sync) < 8.0f) {
                 usleep(500000);
                 buf_len = 0;
                 last_processed_end = 0;
                 samples_since_last_pulse = 0;
                 levels_ready = 0;
-	            continue;
-	        }
+                continue;
+            }
         }
-        /* ---- detect pulses ---- */
+        // detect pulses
         uint32_t *starts = NULL, *ends = NULL;
         size_t n_pulses = detect_pulses(buf, buf_len, levels.sync_threshold,
                                         &starts, &ends);
         n_pulses = clean_pulses(&starts, &ends, n_pulses, &g);
 
-       if (n_pulses == 0) {
+        if (n_pulses == 0) {
             free(starts); free(ends);
 
-            samples_since_last_pulse += need; /* accumulate missing sample span */
+            samples_since_last_pulse += need; // accumulate missing sample span
 
-            /* Check if the gap since the last valid pulse exceeds 20 ms */
+            // Check if the gap since the last valid pulse exceeds RESYNC_GAP_MS
             if (levels_ready && samples_since_last_pulse >= max_gap_samples) {
                 force_resync(&levels, buf, buf_len, &g);
-                samples_since_last_pulse = 0; /* reset gap counter */
+                samples_since_last_pulse = 0; // reset gap counter
 
-                /* Rerun pulse detection immediately with new thresholds */
+                // Rerun pulse detection immediately with new thresholds
                 n_pulses = detect_pulses(buf, buf_len, levels.sync_threshold, &starts, &ends);
                 n_pulses = clean_pulses(&starts, &ends, n_pulses, &g);
             }
 
-            /* If second pass still found no pulses, slide window normally */
+            // If second pass still found no pulses, slide window normally
             if (n_pulses == 0) {
                 if (nread == 0) break;
 
@@ -897,7 +851,7 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Account for samples up to the start of the first pulse, then reset gap counter */
+        // Account for samples up to the start of the first pulse, then reset gap counter
         samples_since_last_pulse = buf_len - ends[n_pulses - 1];
 
         int8_t *kinds = malloc(n_pulses * sizeof(int8_t));
@@ -920,16 +874,14 @@ int main(int argc, char **argv)
 
             uint32_t field_start_sample = starts[lo];
             if ((int64_t)field_start_sample < last_processed_end)
-                continue; /* already handled */
+                continue; // already handled
 
             size_t last_idx = hi > 0 ? hi - 1 : 0;
             if (last_idx >= n_pulses) last_idx = n_pulses - 1;
             if (starts[last_idx] > safe_end)
-                continue; /* not fully inside safe region */
+                continue; // not fully inside safe region
 
-            field_count++;
-            //fprintf(stderr, "Field %zu\n", field_count);
-            //fflush(stderr);
+            //field_count++;
 
             int success = decode_field(buf, buf_len, starts, kinds, lo, hi,
                                        &g, &levels, &stats, payload);
@@ -937,11 +889,12 @@ int main(int argc, char **argv)
                 memset(payload, 0, FIELD_PAYLOAD);
                 printf("Field skip!\n");
             }
+            // In audio mode, we dump the decoded data to the output file
+            // In data mode we save it to the blob, so we can search for MAGIC bytes
             if (mode == MODE_AUDIO) {
                 fwrite(payload, 1, FIELD_PAYLOAD, outf);
                 fflush(outf);
             } else {
-                /* append to blob */
                 if (blob_len + FIELD_PAYLOAD > blob_cap) {
                     blob_cap = (blob_len + FIELD_PAYLOAD) * 2 + 4096;
                     uint8_t *nb = realloc(blob, blob_cap);
@@ -958,9 +911,9 @@ int main(int argc, char **argv)
 
             last_processed_end = (int64_t)starts[last_idx] + g.spl;
 
-            /* ---- header / payload streaming ---- */
+            // header / writing the file
             if (!header_found) {
-                /* search for MAGIC */
+                // search for MAGIC
                 size_t magic_offset = (size_t)-1;
                 for (size_t i = 0; i + 4 <= blob_len; i++) {
                     if (memcmp(blob + i, MAGIC, 4) == 0) {
@@ -980,8 +933,8 @@ int main(int argc, char **argv)
                     if (blob_len >= HEADER_LEN) {
                         memcpy(&payload_length, blob + 4, 4);
                         memcpy(&expected_crc,   blob + 8, 4);
-                        /* little-endian already if host is LE; otherwise swap */
-                        /* assume LE host for simplicity (common for this use) */
+                        // little-endian already if host is LE; otherwise swap
+                        // assume LE host for simplicity (common for this use)
                         header_found = 1;
                         fprintf(stderr, "Header found: length=%u  crc=%08x\n",
                                 payload_length, expected_crc);
@@ -997,7 +950,7 @@ int main(int argc, char **argv)
                             fprintf(stderr, "Flushed %zu payload bytes\n", written);
                             fflush(stderr);
                         }
-                        /* keep remaining unwritten payload */
+                        // keep remaining unwritten payload
                         size_t remain = data_len - to_write;
                         memmove(blob, blob + HEADER_LEN + to_write, remain);
                         blob_len = remain;
@@ -1035,12 +988,12 @@ int main(int argc, char **argv)
 
         if (done) break;
 
-        /* ---- slide buffer ---- */
+        // slide buffer
         if (nread == 0) {
-            /* final pass already attempted via safe_end = whole buffer */
+            // final pass already attempted via safe_end = whole buffer
             if (last_processed_end >= (int64_t)buf_len - (int64_t)g.spl * 2)
                 break;
-            /* force one more iteration with full buffer */
+            // force one more iteration with full buffer
             continue;
         }
 
@@ -1059,9 +1012,7 @@ int main(int argc, char **argv)
     if (infile != stdin) fclose(infile);
     fclose(outf);
 
-    /* ------------------------------------------------------------------ */
-    /* Final report & CRC                                                  */
-    /* ------------------------------------------------------------------ */
+    // Final report & CRC
     fprintf(stderr,
             "\nLines decoded     : %zu/%zu (%zu erased)\n",
             stats.lines_ok, stats.lines_total,
@@ -1079,7 +1030,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* re-read written file for CRC */
+    // re-read written file for CRC
     FILE *cf = fopen(output_path, "rb");
     if (!cf) {
         perror(output_path);
