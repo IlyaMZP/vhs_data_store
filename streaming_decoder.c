@@ -324,81 +324,63 @@ static int decode_line(const float *samples, size_t n_samples,
 
     float spb = (float)g->nominal_spb;
 
-    /* preamble edges near g.pad */
-    float pre_lim = g->pad + (PREAMBLE_BITS + 0.6f) * spb;
-    size_t n_pre = 0;
-    float *pre = malloc(n_edges * sizeof(float));
-    if (!pre) { free(sm); free(edges); return 0; }
-    for (size_t i = 0; i < n_edges; i++) {
-        if (edges[i] < pre_lim)
-            pre[n_pre++] = edges[i];
-    }
-    if (n_pre < PREAMBLE_BITS-2) {
-        free(sm); free(edges); free(pre);
-        return 0;
-    }
+/* 1. Find the first true rising edge of the preamble clock run-in.
+     * We look near g->pad for the low-to-high transition where clock oscillation starts. */
+    float expected_start = g->pad;
+    float start_edge = -1.0f;
+    float min_dist = 1e9f;
 
-    /* phase estimate from median residual */
-    float *resid = malloc(n_pre * sizeof(float));
-    if (!resid) { free(sm); free(edges); free(pre); return 0; }
-    for (size_t i = 0; i < n_pre; i++) {
-        float k = roundf((pre[i] - g->pad) / spb);
-        resid[i] = pre[i] - g->pad - k * spb;
-    }
-    /* median */
-    for (size_t i = 1; i < n_pre; i++) { /* insertion sort */
-        float key = resid[i];
-        size_t j = i;
-        while (j > 0 && resid[j - 1] > key) {
-            resid[j] = resid[j - 1];
-            j--;
-        }
-        resid[j] = key;
-    }
-    float med_resid = resid[n_pre / 2];
-    float e0 = g->pad + med_resid;
+    for (size_t i = 1; i < grid_len; i++) {
+        /* Detect rising edge (Low -> High transition across threshold) */
+        if (sm[i - 1] <= levels->bit_threshold && sm[i] > levels->bit_threshold) {
+            float edge_pos = (float)i - 0.5f;
+            float dist = fabsf(edge_pos - expected_start);
 
-    if (fabsf(e0 - g->pad) > us_to_samples(g->sr, 0.5)) {
-        free(sm); free(edges); free(pre); free(resid);
-        return 0;
-    }
-
-    /* re-check spacing against refined phase */
-    size_t unique_k = 0;
-    float abs_resid_sum = 0.0f;
-    int seen[64] = {0}; /* enough for preamble */
-    for (size_t i = 0; i < n_pre; i++) {
-        float k = roundf((pre[i] - e0) / spb);
-        resid[i] = pre[i] - e0 - k * spb;
-        abs_resid_sum += fabsf(resid[i]);
-        int ki = (int)k;
-        if (ki >= 0 && ki < 64 && !seen[ki]) {
-            seen[ki] = 1;
-            unique_k++;
+            /* Restrict to plausible preamble window (within +/- 1.5 SPB of pad) */
+            if (dist < 1.5f * spb && dist < min_dist) {
+                min_dist = dist;
+                start_edge = edge_pos;
+            }
         }
     }
-    float med_abs = abs_resid_sum / n_pre; /* approx; exact median not critical */
-    /* better median of abs */
-    for (size_t i = 0; i < n_pre; i++) resid[i] = fabsf(resid[i]);
-    for (size_t i = 1; i < n_pre; i++) {
-        float key = resid[i];
-        size_t j = i;
-        while (j > 0 && resid[j - 1] > key) {
-            resid[j] = resid[j - 1];
-            j--;
+
+    /* Fallback if edge search fails completely */
+    if (start_edge < 0.0f) {
+        start_edge = g->pad;
+    }
+
+    /* 2. Candidate evaluation: slide start offset by [-1, 0, +1] bit cycles
+     * and select the offset that best matches the known preamble pattern. */
+    int best_shift = 0;
+    float max_correlation = -1e9f;
+
+    for (int shift = -1; shift <= 1; shift++) {
+        float test_center = start_edge + (0.5f + shift) * spb;
+        float correlation = 0.0f;
+
+        /* Preamble bits alternate: 1, 0, 1, 0... ending in 1, 0 */
+        for (int b = 0; b < PREAMBLE_BITS; b++) {
+            int sample_idx = (int)lroundf(test_center + b * spb);
+            if (sample_idx >= 0 && sample_idx < (int)grid_len) {
+                float val = sm[sample_idx] - levels->bit_threshold;
+                /* Expected preamble pattern: even bits high (>0), odd bits low (<0) */
+                float expected_sign = (b % 2 == 0) ? 1.0f : -1.0f;
+                correlation += val * expected_sign;
+            }
         }
-        resid[j] = key;
-    }
-    med_abs = resid[n_pre / 2];
 
-    free(pre); free(resid);
-    if (med_abs > 0.30f * spb || unique_k < PREAMBLE_BITS-2) {
-        free(sm); free(edges);
-        return 0;
+        if (correlation > max_correlation) {
+            max_correlation = correlation;
+            best_shift = shift;
+        }
     }
 
-    /* early-late DPLL for data bits */
-    float center = e0 + (PREAMBLE_BITS + 0.5f) * spb;
+    /* 3. Final DPLL alignment */
+    float aligned_start = start_edge + best_shift * spb;
+
+    /* Center position for bit 0 of DATA */
+    float center = aligned_start + (PREAMBLE_BITS + 0.5f) * spb;
+
     uint8_t bits[DATA_BITS_PER_LINE];
 
     for (int i = 0; i < DATA_BITS_PER_LINE; i++) {
