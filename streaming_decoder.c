@@ -250,11 +250,11 @@ static int decode_line(const float *samples, size_t n_samples,
     int32_t ext_len = (int32_t)lroundf((g->pad + g->active) * ratio);
     if (ext_len < 10) return 0;
 
-    int64_t a = (int64_t)start + ext_off;
-    int64_t b = a + ext_len;
-    if (a < 0 || b > (int64_t)n_samples) return 0;
+    int64_t ext_start = (int64_t)start + ext_off;
+    int64_t ext_end = ext_start + ext_len;
+    if (ext_start < 0 || ext_end > (int64_t)n_samples) return 0;
 
-    const float *raw = samples + a;
+    const float *raw = samples + ext_start;
     size_t raw_len = (size_t)ext_len;
     size_t grid_len = g->pad + g->active;
 
@@ -262,7 +262,7 @@ static int decode_line(const float *samples, size_t n_samples,
     float *tbc = malloc(grid_len * sizeof(float));
     if (!tbc) return 0;
     for (size_t i = 0; i < grid_len; i++) {
-        float t = (float)i / (float)(grid_len - 1);          // 0..1
+        float t = (float)i / (float)(grid_len - 1);
         float src = t * (raw_len - 1);
         size_t lo = (size_t)floorf(src);
         size_t hi = lo + 1 < raw_len ? lo + 1 : lo;
@@ -513,10 +513,11 @@ static int decode_field(const float *samples, size_t n_samples,
     int vbi_offset = detect_field_parity(starts, kinds, hs_idx[0], g);
 
     // median line period from plausible diffs
-    double P = (double)g->spl;
+    double line_length = (double)g->spl;
     if (n_hs >= 2) {
         double *diffs = malloc((n_hs - 1) * sizeof(double));
         size_t n_plaus = 0;
+        //
         for (size_t j = 1; j < n_hs; j++) {
             double d = (double)starts[hs_idx[j]] - starts[hs_idx[j-1]];
             if (d > 0.9 * g->spl && d < 1.1 * g->spl)
@@ -533,7 +534,7 @@ static int decode_field(const float *samples, size_t n_samples,
                 }
                 diffs[j] = key;
             }
-            P = diffs[n_plaus / 2];
+            line_length = diffs[n_plaus / 2];
         }
         free(diffs);
     }
@@ -547,17 +548,18 @@ static int decode_field(const float *samples, size_t n_samples,
     uint32_t prev = starts[hs_idx[0]];
 
     for (size_t j = 0; j < n_hs; j++) {
-        uint32_t s = starts[hs_idx[j]];
+        uint32_t line_start = starts[hs_idx[j]];
         if (j > 0) {
-            double d = (double)s - prev;
-            if (d < 0.5 * P)
+            double line_diff = (double)line_start - prev; // number of samples between the current sync pulse and the previous accepted sync pulse
+            if (line_diff < 0.5 * line_length)
                 continue; // spurious
-            int k = (int)lround(d / P);
+            int k = (int)lround(line_diff / line_length); // estimate of how many lines could fit into that line_diff
             if (k < 1) k = 1;
             n += k;
-            if (fabs(d / k - P) < 0.02 * P)
-                P = 0.9 * P + 0.1 * (d / k);
-            prev = s;
+            // Are we close to the current estimated length?
+            if (fabs(line_diff / k - line_length) < 0.02 * line_length)
+                line_length = 0.9 * line_length + 0.1 * (line_diff / k); // update line length with rolling average
+            prev = line_start;
         }
 
         int data_idx = n - vbi_offset;
@@ -566,8 +568,8 @@ static int decode_field(const float *samples, size_t n_samples,
             continue;
 
         uint32_t nxt = (j + 1 < n_hs) ? starts[hs_idx[j + 1]]
-                                      : (uint32_t)(s + P);
-        float ratio = (float)((double)(nxt - s) / g->spl);
+                                      : (uint32_t)(line_start + line_length);
+        float ratio = (float)((double)(nxt - line_start) / g->spl);
 
         if (data_idx == DATA_LINES) {
             // Calibration half-line in even field
@@ -576,22 +578,23 @@ static int decode_field(const float *samples, size_t n_samples,
                 size_t cal_len = (size_t)lround(0.5 * g->spl * ratio);
 
                 // Ensure we do not read beyond the input buffer boundaries
-                if (s < n_samples) {
-                    size_t n_avail = n_samples - s;
+                if (line_start < n_samples) {
+                    size_t n_avail = n_samples - line_start;
                     if (cal_len > n_avail) {
                         cal_len = n_avail;
                     }
-                    levels_update_rolling(levels, samples + s, cal_len);
+                    levels_update_rolling(levels, samples + line_start, cal_len);
                 }
             }
             continue;
         }
 
+        // Check if the line length is within 5% of the usual value
         if (!(0.95f < ratio && ratio < 1.05f))
-            ratio = (float)(P / g->spl);
+            ratio = (float)(line_length / g->spl);
 
         uint8_t line_bytes[LINE_BYTES];
-        if (decode_line(samples, n_samples, s, ratio, g, levels, line_bytes)) {
+        if (decode_line(samples, n_samples, line_start, ratio, g, levels, line_bytes)) {
             memcpy(stream + data_idx * LINE_BYTES, line_bytes, LINE_BYTES);
             line_ok[data_idx] = 1;
         }
