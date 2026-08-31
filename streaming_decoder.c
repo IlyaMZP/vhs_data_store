@@ -301,7 +301,7 @@ static int decode_line(const float *samples, size_t n_samples,
 
     // Find the first true rising edge of the preamble clock run-in.
     // We look near g->pad for the low-to-high transition where clock oscillation starts.
-    float expected_start = g->pad;
+    float expected_start = g->pad*0.5f; // I don't even know, but this helps for head switching distorted lines
     float start_edge = -1.0f;
     float min_dist = 1e9f;
 
